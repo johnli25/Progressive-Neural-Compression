@@ -150,8 +150,13 @@ if __name__ == "__main__":
         return sys.getsizeof(obj)
     
     def calculate_SE_per_frame(A,B):
-        A, B = np.array(A), np.array(B)
+        A, B = np.array(A), np.array(B)[0] # because A's shape is, for example (224, 224, 3) and B's shape is (1, 224, 224, 3)
+        print("A and B shapes", A.shape, B.shape)
         return (np.sum((A - B) ** 2))
+    
+    def calculate_SE_per_frame_new(frame_name, B):
+        frame = np.array(tf.io.read_file(frame_name))  
+
     
     def recvall(sock, count):
         buf = b''
@@ -257,7 +262,6 @@ if __name__ == "__main__":
 
             plt.imsave("{}/{}".format(PNC_received_directory, video_img_frame), decoded_data[0,:,:,:])
             # plt.imsave("{}/{}".format(FrameCorr_received_directory, video_img_frame), decoded_data[0,:,:,:])
-
             pnc_mse = calculate_SE_per_frame(output_image, decoded_data)
             # framecorr_mse = calculate_SE_per_frame(output_image, decoded_data)
             PNC_video_frame_mse[video].append(pnc_mse)
@@ -266,14 +270,9 @@ if __name__ == "__main__":
         print("PNC Video Frame MSE")
         for k, v in PNC_video_frame_mse.items():
             print("Video: {} MSE: {}  # of Bytes {}".format(k, np.mean(v), len(v) * 32 * 32 * 10))
-            # print(np.mean(v))
 
-        print("FrameCorr Video Frame MSE")
-        for k, v in FrameCorr_video_mse.items():
-            # print("Video: {} MSE: {}".format(k, np.mean(v)))
-            print(np.mean(v))
-
-
+    # Sender: Set the seed for reproducibility
+    random.seed(42)
 
     if args.mode == 0:  # Sender
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s_sock:
@@ -281,15 +280,14 @@ if __name__ == "__main__":
                 # Encode the frame and get frame title
                 video_img_frame = "".join(file.numpy().decode("utf-8").split("/")[-1][:-4]) + ".jpg"
                 encoded_data = np.array(encoder.predict(tf.expand_dims(input_image, axis=0)))
-                feature_end = encoded_data.shape[-1]
 
-                # Convert each slice to 1-byte integers and send
-                for i in range(feature_end):
+                for i in range(1):
                     # print(encoded_data[..., i, 0, 0][0])
                     # feature_slice = (encoded_data[..., i] * 255).astype(np.uint8).tobytes()  # Scale to 1-byte range and convert
+                    # if random.random() < 0.05:
+                    #     print("Randomly dropping slice")
+                    #     continue
                     feature_slice = encoded_data[..., i].tobytes()
-                    # print(feature_slice[0])
-                    # Pack title, slice index, and data
                     packet = struct.pack(f'32sI{SLICE_SIZE}s', video_img_frame.encode(), i, feature_slice)
                     s_sock.sendto(packet, (args.host, args.port))
 
@@ -305,6 +303,7 @@ if __name__ == "__main__":
 
             # Prepare dictionary to store frames by title
             frames = {}
+            PNC_video_frame_mse = defaultdict(list)
 
             # Receive and process each packet
             print("Receiving frames...")
@@ -317,23 +316,23 @@ if __name__ == "__main__":
                     break
 
                 # Otherwise, unpack title, slice index, and slice data
-                title, slice_index, slice_data = struct.unpack(f'32sI{SLICE_SIZE}s', packet)
-                title = title.decode().strip('\x00')  # Remove padding from title
-
+                frame_name, slice_index, slice_data = struct.unpack(f'32sI{SLICE_SIZE}s', packet)
+                frame_name = frame_name.decode().strip('\x00')  # Remove padding from title
                 # Initialize frame buffer if it’s the first slice of this frame
-                if title not in frames:
-                    frames[title] = np.zeros((1, 32, 32, 10), dtype=np.float32)
+                if frame_name not in frames:
+                    frames[frame_name] = np.zeros((1, 32, 32, 10), dtype=np.float32)
+                    # start_time = time.time()
 
                 # Convert the buffer to a numpy array and reshape it
                 slice_array = np.frombuffer(slice_data, dtype=np.float32).reshape(1, 32, 32)
                 print("slice_array", slice_array.shape)
 
                 # Remove the last dimension to match the expected shape (32, 32)
-                frames[title][..., slice_index] = slice_array
+                frames[frame_name][..., slice_index] = slice_array
             
             # Decode and save each frame
             print("Done Receiving! Decoding now")
-            for title, image_array in frames.items():
+            for frame_name, image_array in frames.items():
                 # Convert image array to float and decode even if not fully complete
                 # image_array = image_array.astype(np.float32) / 255.0  # Scale back to float range
                 # print(image_array[:, :, :, 0, 0][0])
@@ -343,8 +342,19 @@ if __name__ == "__main__":
                 received_directory = "CS537_Received_imgs"
                 if not os.path.exists(received_directory):
                     os.makedirs(received_directory)
-                plt.imsave(f"{received_directory}/{title}", decoded_data[0, :, :, :])
+                plt.imsave(f"{received_directory}/{frame_name}", decoded_data[0, :, :, :])
+                if frame_name in frames:
+                    ground_truth_img = tf.image.convert_image_dtype(
+                        tf.image.decode_image(
+                            tf.io.read_file(f"PNC_FrameCorr_input_imgs/{frame_name}")
+                        ), tf.float32
+                    )
+                    pnc_mse = calculate_SE_per_frame(ground_truth_img, decoded_data)
+                    video_name = "_".join(frame_name.split("_")[:-1])
+                    PNC_video_frame_mse[video_name].append(pnc_mse)
 
-                # print(f"Frame '{title}' saved with {np.count_nonzero(image_array) / SLICE_SIZE} received slices")
+            print("PNC Video Frame MSE")
+            for k, v in PNC_video_frame_mse.items():
+                print(np.mean(v)) # NOTE: prints the MSE for each video
+                # print("Video: {} MSE: {}    Len of Video {}".format(k, np.mean(v), len(v)))
 
-            frames.clear()  # Clear frames after decoding and saving (not necessary)
